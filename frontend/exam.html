@@ -1,0 +1,319 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Online Exam - Demo</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 20px; }
+    .hidden { display:none }
+    video { width: 240px; height: 160px; background:#000; }
+    #status { margin-top:10px; }
+    .metrics { margin-top:10px; }
+  </style>
+</head>
+<body>
+  <h2>Online Exam (Demo)</h2>
+
+  <div id="auth">
+    <input id="email" placeholder="email" /><br/><br/>
+    <input id="pass" placeholder="password" type="password"/><br/><br/>
+    <button id="register">Register</button>
+    <button id="login">Login</button>
+  </div>
+
+  <div id="examUI" class="hidden">
+    <div>
+      <button id="startExam">Start Exam</button>
+      <button id="stopExam" disabled>Stop Exam</button>
+    </div>
+
+    <div id="videos">
+      <div>
+        <h4>Camera</h4>
+        <video id="camPreview" autoplay muted playsinline></video>
+      </div>
+      <div>
+        <h4>Screen</h4>
+        <video id="screenPreview" autoplay muted playsinline></video>
+      </div>
+    </div>
+
+    <div id="status"></div>
+
+    <div class="metrics">
+      <div>Tab switches: <span id="tabSwitchCount">0</span></div>
+      <div>Face absent seconds: <span id="faceAbsentS">0</span></div>
+      <div>High motion events: <span id="motionCount">0</span></div>
+      <div>Voice loud seconds: <span id="loudS">0</span></div>
+      <div>Voice silent seconds: <span id="silentS">0</span></div>
+      <div>Computed score: <span id="score">-</span></div>
+    </div>
+  </div>
+
+<script>
+const API_BASE = 'http://localhost:4000/api';
+let token = null;
+const state = {
+  tabSwitchCount:0, faceAbsentS:0, motionCount:0, loudS:0, silentS:0, duration:0
+};
+
+document.getElementById('register').onclick = async ()=>{
+  const email = document.getElementById('email').value;
+  const pass = document.getElementById('pass').value;
+  const res = await fetch(API_BASE+'/auth/register', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name:'student', email, password:pass})
+  });
+  const j = await res.json(); alert(JSON.stringify(j));
+};
+
+document.getElementById('login').onclick = async ()=>{
+  const email = document.getElementById('email').value;
+  const pass = document.getElementById('pass').value;
+  const res = await fetch(API_BASE+'/auth/login', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ email, password:pass })
+  });
+  const j = await res.json();
+  if (j.token) {
+    token = j.token;
+    document.getElementById('auth').classList.add('hidden');
+    document.getElementById('examUI').classList.remove('hidden');
+  } else alert('Login failed: '+JSON.stringify(j));
+};
+
+let mediaRecorder, recordedChunks=[], recordingStart;
+let camStream, screenStream, mixedStream;
+let audioContext, analyser, micSource;
+let frameCheckerInterval, statsInterval;
+let canvasOff, ctxOff, lastFrameData, motionThreshold = 20000;
+
+document.getElementById('startExam').onclick = startExam;
+document.getElementById('stopExam').onclick = stopExam;
+
+async function startExam(){
+  recordedChunks = [];
+  // get camera + mic
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({ video: { width:320, height:240 }, audio: true });
+    document.getElementById('camPreview').srcObject = camStream;
+  } catch (e) { alert('Camera/mic permission needed: '+e.message); return; }
+
+  // get screen (user chooses window/tab/screen)
+  try {
+    screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+    document.getElementById('screenPreview').srcObject = screenStream;
+  } catch (e) { alert('Screen share needed: '+e.message); return; }
+
+  // combine tracks: video tracks from screen (primary) + camera as PIP via canvas mixing OR include camera separately.
+  // Simpler approach: create a single MediaStream with screen video track + microphone audio track(s) + camera video track (some browsers allow multiple video tracks)
+  mixedStream = new MediaStream();
+  // prefer screen video
+  const screenVid = screenStream.getVideoTracks()[0];
+  if (screenVid) mixedStream.addTrack(screenVid);
+  // add camera video if present
+  const camVid = camStream.getVideoTracks()[0];
+  if (camVid) mixedStream.addTrack(camVid);
+  // add audio: prefer mic audio from camStream
+  const mic = camStream.getAudioTracks()[0];
+  if (mic) mixedStream.addTrack(mic);
+
+  // show previews (already set)
+  document.getElementById('startExam').disabled = true;
+  document.getElementById('stopExam').disabled = false;
+
+  // setup MediaRecorder
+  const options = { mimeType: 'video/webm;codecs=vp9,opus' };
+  try {
+    mediaRecorder = new MediaRecorder(mixedStream, options);
+  } catch (e) {
+    console.warn('fallback mime', e);
+    mediaRecorder = new MediaRecorder(mixedStream);
+  }
+
+  mediaRecorder.ondataavailable = e => { if (e.data && e.data.size) recordedChunks.push(e.data); };
+  mediaRecorder.onstart = ()=> { recordingStart = Date.now(); document.getElementById('status').innerText='Recording...'; };
+  mediaRecorder.start(1000); // collect every 1s
+
+  // setup audio analyser for voice level
+  audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  micSource = audioContext.createMediaStreamSource(new MediaStream([mic]));
+  analyser = audioContext.createAnalyser();
+  analyser.fftSize = 2048;
+  micSource.connect(analyser);
+
+  // setup offscreen canvas to analyze camera frames for motion/face presence
+  canvasOff = document.createElement('canvas');
+  canvasOff.width = 160; canvasOff.height = 120;
+  ctxOff = canvasOff.getContext('2d');
+
+  // periodically check frame diff for motion & face presence
+  lastFrameData = null;
+  frameCheckerInterval = setInterval(checkFrame, 400); // ~2.5 checks/sec
+  statsInterval = setInterval(updateStats, 1000);
+
+  // visibility change
+  document.addEventListener('visibilitychange', onVisibilityChange);
+  window.addEventListener('blur', onBlur);
+  window.addEventListener('focus', onFocus);
+
+  // initialize timers
+  state.tabSwitchCount = 0;
+  state.faceAbsentS = 0;
+  state.motionCount = 0;
+  state.loudS = 0;
+  state.silentS = 0;
+  state.duration = 0;
+}
+
+function onVisibilityChange(){
+  if (document.hidden) {
+    state.tabSwitchCount += 1;
+    document.getElementById('tabSwitchCount').innerText = state.tabSwitchCount;
+  }
+}
+function onBlur(){ state.tabSwitchCount += 1; document.getElementById('tabSwitchCount').innerText = state.tabSwitchCount; }
+function onFocus(){ /* nothing */ }
+
+function checkFrame(){
+  // draw current camera frame
+  const camVideo = document.getElementById('camPreview');
+  if (!camVideo || camVideo.readyState < 2) {
+    // if no camera frame, count as absent
+    state.faceAbsentS += 0.4;
+    document.getElementById('faceAbsentS').innerText = Math.round(state.faceAbsentS);
+    return;
+  }
+  try {
+    ctxOff.drawImage(camVideo, 0, 0, canvasOff.width, canvasOff.height);
+    const img = ctxOff.getImageData(0,0,canvasOff.width,canvasOff.height);
+    const cur = img.data;
+    if (lastFrameData) {
+      // compute simple motion: sum of absolute differences of grayscale
+      let diffSum = 0;
+      for (let i=0;i<cur.length;i+=4){
+        const g = (cur[i]+cur[i+1]+cur[i+2])/3;
+        const l = lastFrameData[i]; // store grayscale in lastFrameData array's same index
+        const d = Math.abs(g - l);
+        diffSum += d;
+        // store grayscale into img.data to reuse (we'll set later)
+        img.data[i] = g; img.data[i+1]=g; img.data[i+2]=g;
+      }
+      if (diffSum > motionThreshold) {
+        state.motionCount +=1;
+        document.getElementById('motionCount').innerText = state.motionCount;
+      }
+      // if brightness too low or almost blank, treat as face absent
+      let brightness = 0;
+      for (let i=0;i<cur.length;i+=4) brightness += cur[i];
+      const avgB = brightness / (cur.length/4);
+      if (avgB < 15) { state.faceAbsentS += 0.4; document.getElementById('faceAbsentS').innerText = Math.round(state.faceAbsentS); }
+    } else {
+      // initialize lastFrameData array of grayscale values
+      lastFrameData = new Uint8ClampedArray(cur.length);
+    }
+    // store grayscale into lastFrameData
+    for (let i=0;i<cur.length;i+=4){
+      const g = (cur[i]+cur[i+1]+cur[i+2])/3;
+      lastFrameData[i] = g;
+    }
+  } catch (e) {
+    console.error('frame check error', e);
+    state.faceAbsentS += 0.4;
+    document.getElementById('faceAbsentS').innerText = Math.round(state.faceAbsentS);
+  }
+}
+
+function updateStats(){
+  state.duration = Math.round((Date.now() - recordingStart)/1000);
+  // audio level check: compute RMS
+  const arr = new Uint8Array(analyser.fftSize);
+  analyser.getByteTimeDomainData(arr);
+  let sum = 0;
+  for (let i=0;i<arr.length;i++){
+    const v = (arr[i]-128)/128;
+    sum += v*v;
+  }
+  const rms = Math.sqrt(sum / arr.length);
+  // thresholds: rms > 0.06 ~ loud; < 0.01 ~ silent
+  if (rms > 0.06) state.loudS += 1; else if (rms < 0.01) state.silentS += 1;
+  document.getElementById('loudS').innerText = state.loudS;
+  document.getElementById('silentS').innerText = state.silentS;
+
+  // compute a simple score now
+  const score = computeScore();
+  document.getElementById('score').innerText = score.toFixed(1);
+}
+
+function computeScore(){
+  // Score starts at 10, subtract normalized penalties
+  let score = 10;
+  // penalize tab switches: each switch -0.5 up to -3
+  score -= Math.min(3, state.tabSwitchCount * 0.5);
+  // penalize face absence: every 5 seconds absent -> -1
+  score -= Math.min(4, Math.floor(state.faceAbsentS / 5));
+  // penalize motion events moderately: each motion event -0.3 up to -2
+  score -= Math.min(2, state.motionCount * 0.3);
+  // penalize loud voice (e.g., long suspicious talking): every 10s loud -> -0.5
+  score -= Math.min(1.5, Math.floor(state.loudS / 10) * 0.5);
+  // penalize too much silence (maybe candidate muted): every 30s silent -> -0.5
+  score -= Math.min(1.5, Math.floor(state.silentS / 30) * 0.5);
+  if (score < 0) score = 0;
+  return score;
+}
+
+async function stopExam(){
+  document.getElementById('stopExam').disabled = true;
+  document.getElementById('status').innerText = 'Stopping...';
+  clearInterval(frameCheckerInterval);
+  clearInterval(statsInterval);
+  document.removeEventListener('visibilitychange', onVisibilityChange);
+  window.removeEventListener('blur', onBlur);
+  window.removeEventListener('focus', onFocus);
+
+  mediaRecorder.stop();
+  // stop streams
+  camStream.getTracks().forEach(t=>t.stop());
+  screenStream.getTracks().forEach(t=>t.stop());
+  if (audioContext) audioContext.close();
+
+  // wait a short time to ensure dataavailable events fired
+  setTimeout(async ()=>{
+    const blob = new Blob(recordedChunks, { type: 'video/webm' });
+    const filename = 'submission-' + Date.now() + '.webm';
+    // prepare metadata and computed score
+    const meta = {
+      tabSwitchCount: state.tabSwitchCount,
+      faceAbsentSeconds: Math.round(state.faceAbsentS),
+      highMotionEvents: state.motionCount,
+      voiceLoudSeconds: state.loudS,
+      voiceSilentSeconds: state.silentS,
+      durationSeconds: state.duration,
+      computedScore: computeScore()
+    };
+
+    // upload to backend
+    const fd = new FormData();
+    fd.append('examId', 'demo-exam-1');
+    fd.append('meta', JSON.stringify(meta));
+    fd.append('recording', blob, filename);
+
+    try {
+      const res = await fetch(API_BASE + '/exam/submit', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer '+token },
+        body: fd
+      });
+      const j = await res.json();
+      alert('Upload result: ' + JSON.stringify(j));
+      document.getElementById('status').innerText = 'Uploaded. Score: ' + meta.computedScore;
+      document.getElementById('startExam').disabled = false;
+    } catch (e) {
+      alert('Upload failed: '+e.message);
+      document.getElementById('startExam').disabled = false;
+    }
+  }, 1500);
+}
+</script>
+</body>
+</html>
